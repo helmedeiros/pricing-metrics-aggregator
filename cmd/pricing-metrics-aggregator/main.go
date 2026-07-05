@@ -38,10 +38,18 @@ func main() {
 	warmup := flag.Duration("warmup", 5*time.Second, "startup grace before the first tick (lets health probes go green)")
 
 	otelEnabled := flag.Bool("otel-enabled", false, "bootstrap the OTel SDK + export via OTLP gRPC")
+	includeLabels := flag.String("include-labels", "", "comma-separated subset of {experiment, variant, customer_tier, country} to bucket by; empty (default) publishes env-only gauges. See ADR-0003.")
+	topN := flag.Int("top-n", 50, "max number of labeled tuples emitted per window; the rest fold into a single '_other_' series. 0 disables the cap. Only meaningful when --include-labels is set.")
 	flag.Parse()
 
 	log := jsonlog.New(os.Stdout)
-	metrics := prom.New(*env)
+
+	sel, err := rollup.ParseLabelSelection(*includeLabels)
+	if err != nil {
+		log.Error("include_labels.invalid", map[string]any{"error": err.Error()})
+		os.Exit(2)
+	}
+	metrics := prom.New(*env, sel)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -105,7 +113,7 @@ func main() {
 	// Immediate first pass so the metrics have a value before the first
 	// tick lands. Any operator watching /metrics right after boot sees
 	// zeros for empty buckets — not stale from the last binary.
-	runOnce(ctx, reader, *bucket, *env, *interval, metrics, log)
+	runOnce(ctx, reader, *bucket, *env, *interval, sel, *topN, metrics, log)
 
 	for {
 		select {
@@ -117,7 +125,7 @@ func main() {
 			log.Info("pricing-metrics-aggregator.stopped", nil)
 			return
 		case <-tick.C:
-			runOnce(ctx, reader, *bucket, *env, *interval, metrics, log)
+			runOnce(ctx, reader, *bucket, *env, *interval, sel, *topN, metrics, log)
 		}
 	}
 }
@@ -127,6 +135,8 @@ func runOnce(
 	reader *ingest.Reader,
 	bucket, env string,
 	interval time.Duration,
+	sel rollup.LabelSelection,
+	topN int,
 	metrics *prom.Metrics,
 	log *jsonlog.Logger,
 ) {
@@ -134,7 +144,7 @@ func runOnce(
 	to := start.UTC()
 	from := to.Add(-interval)
 
-	var w rollup.Window
+	w := rollup.New(sel)
 
 	// search.v1 → impressions
 	searchCount, sErr := reader.EachEvent(ctx, bucket, "search-v1/", env, from, to, func(row []byte) error {
@@ -150,13 +160,12 @@ func runOnce(
 		return nil
 	})
 
-	// Publish
-	metrics.ImpressionsLastWindow.WithLabelValues().Set(float64(w.Impressions))
-	metrics.PurchasesLastWindow.WithLabelValues().Set(float64(w.Purchases))
-	metrics.WalkoffsAtInitLastWindow.WithLabelValues().Set(float64(w.WalkoffsAtInit))
-	metrics.WalkoffsAtReserveLastWindow.WithLabelValues().Set(float64(w.WalkoffsAtReserve))
-	metrics.GMVLastWindowEUR.WithLabelValues().Set(w.GMV)
-	metrics.ConversionRateLastWindow.WithLabelValues().Set(w.ConversionRate())
+	// Publish env-only totals every tick.
+	metrics.PublishTotal(w.Total)
+	// Publish labeled top-N when the operator opted in; no-op otherwise.
+	if sel.Any() {
+		metrics.PublishLabeled(rollup.TopN(w.Labeled, sel, topN))
+	}
 
 	duration := time.Since(start)
 	metrics.RunDurationSeconds.Observe(duration.Seconds())
@@ -171,27 +180,27 @@ func runOnce(
 			msgs = append(msgs, "booking: "+bErr.Error())
 		}
 		log.Warn("pricing-metrics-aggregator.run_error", map[string]any{
-			"error":                     strings.Join(msgs, "; "),
-			"impressions":               w.Impressions,
-			"purchases":                 w.Purchases,
-			"duration_seconds":          duration.Seconds(),
-			"search_objects_scanned":    searchCount,
-			"booking_objects_scanned":   bookingCount,
+			"error":                   strings.Join(msgs, "; "),
+			"impressions":             w.Impressions(),
+			"purchases":               w.Purchases(),
+			"duration_seconds":        duration.Seconds(),
+			"search_objects_scanned":  searchCount,
+			"booking_objects_scanned": bookingCount,
 		})
 		return
 	}
 
 	metrics.RunsTotal.WithLabelValues("ok").Inc()
 	log.Info("pricing-metrics-aggregator.run_ok", map[string]any{
-		"impressions":               w.Impressions,
-		"purchases":                 w.Purchases,
-		"walkoffs_at_init":          w.WalkoffsAtInit,
-		"walkoffs_at_reserve":       w.WalkoffsAtReserve,
-		"gmv_eur":                   w.GMV,
-		"conversion_rate":           w.ConversionRate(),
-		"duration_seconds":          duration.Seconds(),
+		"impressions":         w.Impressions(),
+		"purchases":           w.Purchases(),
+		"walkoffs_at_init":    w.WalkoffsAtInit(),
+		"walkoffs_at_reserve": w.WalkoffsAtReserve(),
+		"gmv_eur":             w.GMV(),
+		"conversion_rate":     w.ConversionRate(),
+		"duration_seconds":    duration.Seconds(),
+		"labeled_tuples":      len(w.Labeled),
 	})
-	// Guard against the `errors` import being flagged unused when
-	// build-time flags disable branches.
+	// Guard the `errors` import against being flagged unused.
 	_ = errors.Is
 }

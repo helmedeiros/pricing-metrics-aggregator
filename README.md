@@ -44,6 +44,8 @@ curl -sS http://localhost:8082/metrics | grep '^pricing_'
 | `--interval` | `5m` | Aggregation interval (window is tumbling, size = interval) |
 | `--warmup` | `5s` | Startup grace before the first tick |
 | `--otel-enabled` | `false` | Bootstrap OTel SDK + OTLP gRPC export |
+| `--include-labels` | `""` | Comma-separated subset of `{experiment, variant, customer_tier, country}` to bucket by. Empty (default) preserves the env-only surface. See ADR-0002. |
+| `--top-n` | `50` | Max number of labeled tuples per window; the rest fold into a single `_other_` series. `0` disables the cap. Only meaningful when `--include-labels` is set. |
 
 ## Quality gates
 

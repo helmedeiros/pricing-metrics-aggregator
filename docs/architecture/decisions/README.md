@@ -5,3 +5,4 @@ Each Markdown file records one architectural decision. New records are appended 
 | ADR | Title | Status |
 |-----|-------|--------|
 | [0001](0001-role.md) | Role of pricing-metrics-aggregator in the platform | ✅ Accepted |
+| [0002](0002-metric-cardinality-caps.md) | Metric cardinality caps + per-arm / per-segment gauges | ✅ Accepted |
